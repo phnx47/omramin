@@ -319,6 +319,9 @@ class OmronDevice:
     category: T.Optional[DeviceCategory] = None
     user: int = 1
     enabled: bool = True
+    # Kii deviceSerialID is 8 bytes, the stored BLE MAC only 6, so mac -> serial is lossy.
+    # Keep the real serial when the server provides it.
+    real_serial: T.Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.category, DeviceCategory):
@@ -335,7 +338,7 @@ class OmronDevice:
 
     @property
     def serial(self) -> str:
-        return ble_mac_to_serial(self.macaddr)
+        return self.real_serial or ble_mac_to_serial(self.macaddr)
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -411,6 +414,7 @@ class OmronConnect1(OmronConnect):
 
         # Set _APP_URL using the selected app_id
         self._APP_URL = f"/apps/{app_id}/server-code"
+        self._registeredDevices: T.Optional[list[OmronDevice]] = None
 
         # Wrap transport with LogTransport for debug logging with credential redaction
         self._client = httpx.Client(
@@ -566,24 +570,41 @@ class OmronConnect1(OmronConnect):
                 name=f"{device['deviceModel']}:{device['userNumberInDevice']}",
                 macaddr=serial_to_mac(device["deviceSerialID"]),
                 user=int(device["userNumberInDevice"]),
+                real_serial=device["deviceSerialID"],
             )
             result.append(ocDev)
 
         return result
 
+    def _resolve_device(self, device: OmronDevice) -> OmronDevice:
+        """Find the server side device (real serial and model) matching a configured device by MAC and user."""
+
+        if self._registeredDevices is None:
+            self._registeredDevices = self.get_registered_devices(days=None) or []
+
+        for d in self._registeredDevices:
+            if d.macaddr.lower() == device.macaddr.lower() and d.user == device.user:
+                return d
+
+        L.debug(f"Device {device.name} not found in registered devices, using configured values")
+        return device
+
     # utc timestamps
     def get_measurements(
         self, device: OmronDevice, searchDateFrom: int = 0, searchDateTo: int = 0
     ) -> T.List[MeasurementTypes]:
+        regDevice = device if device.real_serial else self._resolve_device(device)
+        serial = regDevice.serial
         data = {
             "containCorrectedDataFlag": 1,
             "containAllDataTypeFlag": 1,
             "deviceCategory": device.category,
-            "deviceSerialID": device.serial,
+            # required, otherwise deviceModelList is always null
+            "deviceModel": regDevice.name.rsplit(":", 1)[0],
+            "deviceSerialID": serial,
             "userNumberInDevice": int(device.user),
             "searchDateFrom": searchDateFrom if searchDateFrom >= 0 else 0,
             "searchDateTo": int(U.utcnow().timestamp() * 1000) if searchDateTo <= 0 else searchDateTo,
-            # "deviceModel": "OGSC", "HBF-xxx", ...
         }
 
         r = self._client.post(
@@ -608,7 +629,7 @@ class OmronConnect1(OmronConnect):
 
         if _debugSaveResponse:
             assert device.category is not None, "Device category must be set for get_measurements"
-            fname = f".debug/{data['searchDateTo']}_{device.category.name}_{device.serial}_{device.user}.json"
+            fname = f".debug/{data['searchDateTo']}_{device.category.name}_{serial}_{device.user}.json"
             U.json_save(fname, returnedValue)
 
         measurements: T.List[MeasurementTypes] = []
@@ -618,12 +639,12 @@ class OmronConnect1(OmronConnect):
             return measurements
 
         for devModel in deviceModelList:
-            measurements.extend(self._process_device_model(devModel, device, devCat))
+            measurements.extend(self._process_device_model(devModel, device, serial, devCat))
 
         return measurements
 
     def _process_device_model(
-        self, devModel: T.Dict[str, T.Any], device: OmronDevice, devCat: DeviceCategory
+        self, devModel: T.Dict[str, T.Any], device: OmronDevice, serial: str, devCat: DeviceCategory
     ) -> T.List[MeasurementTypes]:
         measurements: T.List[MeasurementTypes] = []
         deviceModel = devModel["deviceModel"]
@@ -633,7 +654,7 @@ class OmronConnect1(OmronConnect):
             user = dev["userNumberInDevice"]
             L.debug(f" - deviceModel: {deviceModel} category: {devCat.name} serial: {deviceSerialID} user: {user}")
 
-            if deviceSerialID != device.serial:
+            if deviceSerialID != serial:
                 continue
 
             if device.category == DeviceCategory.BPM:
