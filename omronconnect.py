@@ -713,31 +713,18 @@ class OmronConnect1(OmronConnect):
             weight = convert_data_util(weight_entry.value, weight_entry.scale)
             weightUnit = weight_entry.subtype
             weight = convert_weight_to_kg(weight, weightUnit)
-            bodyFatPercentage = convert_data_util(
-                bodyIndexList[ValueType.BODY_FAT_PER_FIGURE].value,
-                bodyIndexList[ValueType.BODY_FAT_PER_FIGURE].scale,
-            )
-            skeletalMusclePercentage = convert_data_util(
-                bodyIndexList[ValueType.RATE_SKELETAL_MUSCLE_FIGURE].value,
-                bodyIndexList[ValueType.RATE_SKELETAL_MUSCLE_FIGURE].scale,
-            )
-            basal_met = convert_data_util(
-                bodyIndexList[ValueType.BASAL_METABOLISM_FIGURE].value,
-                bodyIndexList[ValueType.BASAL_METABOLISM_FIGURE].scale,
-            )
-            metabolic_age = convert_data_util(
-                bodyIndexList[ValueType.BIOLOGICAL_AGE_FIGURE].value,
-                bodyIndexList[ValueType.BIOLOGICAL_AGE_FIGURE].scale,
-                int,
-            )
-            visceral_fat_rating = convert_data_util(
-                bodyIndexList[ValueType.VISCERAL_FAT_FIGURE].value,
-                bodyIndexList[ValueType.VISCERAL_FAT_FIGURE].scale,
-            )
-            bmi = convert_data_util(
-                bodyIndexList[ValueType.BMI_FIGURE].value,
-                bodyIndexList[ValueType.BMI_FIGURE].scale,
-            )
+
+            def opt_value(valueType: ValueType, _type: type[float] | type[int] = float) -> T.Any:
+                # weight-only scales (e.g. HN-300T2) report no body composition values
+                item = bodyIndexList.get(valueType)
+                return convert_data_util(item.value, item.scale, _type) if item else _type(Decimal(-1))
+
+            bodyFatPercentage = opt_value(ValueType.BODY_FAT_PER_FIGURE)
+            skeletalMusclePercentage = opt_value(ValueType.RATE_SKELETAL_MUSCLE_FIGURE)
+            basal_met = opt_value(ValueType.BASAL_METABOLISM_FIGURE)
+            metabolic_age = opt_value(ValueType.BIOLOGICAL_AGE_FIGURE, int)
+            visceral_fat_rating = opt_value(ValueType.VISCERAL_FAT_FIGURE)
+            bmi = opt_value(ValueType.BMI_FIGURE)
             timeZone = pytz.timezone(m["timeZone"])
 
             wm = WeightMeasurement(
