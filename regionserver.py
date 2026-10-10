@@ -169,4 +169,21 @@ def get_credentials_for_server(server_url: str) -> T.Optional[T.Tuple[str, str]]
     return server_credentials.get(server_url)
 
 
+def get_bpmanager_config_for_server(server_url: str) -> T.Optional[T.Dict[str, str]]:
+    """
+    Get BP Manager (AWS Cognito backed) configuration for an API v1 server URL.
+
+    Some regions (e.g. SG) store blood pressure readings in BP Manager instead of Kii.
+
+    Returns:
+        Dict with 'url', 'cognitoRegion', 'cognitoClientId', or None if not used by server
+    """
+
+    for group in _load_region_v1_data():
+        if group.get("cloudUrl") == server_url:
+            return group.get("bpManager")
+
+    return None
+
+
 ########################################################################################################################
