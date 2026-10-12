@@ -28,11 +28,15 @@ def transport_set_logger(logger: logging.Logger) -> None:
 # need to be lowercase
 _REDACTED_KEYS = {
     "emailaddress",
+    "username",
     "password",
     "accesstoken",
+    "access_token",
     "oldtoken",
     "refreshtoken",
+    "refresh_token",
     "idtoken",
+    "id_token",
     "token",
     "phoneidentifier",
     "userid_type_devicelocalname",

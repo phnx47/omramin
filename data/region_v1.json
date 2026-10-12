@@ -24,7 +24,12 @@
     ],
     "appID": "lou30y2xfa9f",
     "appKey": "392a4bdff8af4141944d30ca8e3cc860",
-    "cloudUrl": "https://data-sg.omronconnect.com/api"
+    "cloudUrl": "https://data-sg.omronconnect.com/api",
+    "bpManager": {
+      "url": "https://elb-sg.bp-manager.com",
+      "cognitoRegion": "ap-southeast-1",
+      "cognitoClientId": "3r0hqg0f0oivg1vok4dqci8mhh"
+    }
   },
   {
     "countries": [

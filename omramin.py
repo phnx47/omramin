@@ -1244,7 +1244,7 @@ def _add_scale_measurement(gc: GC.Garmin, dtLocal: datetime, wm: OC.WeightMeasur
             physique_rating=None,
             metabolic_age=wm.metabolicAge if wm.metabolicAge > 0 else None,
             visceral_fat_rating=wm.visceralFatLevel if wm.visceralFatLevel > 0 else None,
-            bmi=wm.bmiValue,
+            bmi=wm.bmiValue if wm.bmiValue > 0 else None,
         )
         L.debug("Scale measurement written successfully")
 

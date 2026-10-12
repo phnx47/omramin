@@ -20,7 +20,7 @@ from httpx import HTTPStatusError
 
 import utils as U
 from httpxlogtransport import HttpxLogTransport, transport_set_logger
-from regionserver import get_credentials_for_server, get_servers_for_country_code
+from regionserver import get_bpmanager_config_for_server, get_credentials_for_server, get_servers_for_country_code
 
 ########################################################################################################################
 
@@ -319,6 +319,9 @@ class OmronDevice:
     category: T.Optional[DeviceCategory] = None
     user: int = 1
     enabled: bool = True
+    # Kii deviceSerialID is 8 bytes, the stored BLE MAC only 6, so mac -> serial is lossy.
+    # Keep the real serial when the server provides it.
+    real_serial: T.Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.category, DeviceCategory):
@@ -335,7 +338,7 @@ class OmronDevice:
 
     @property
     def serial(self) -> str:
-        return ble_mac_to_serial(self.macaddr)
+        return self.real_serial or ble_mac_to_serial(self.macaddr)
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -411,6 +414,7 @@ class OmronConnect1(OmronConnect):
 
         # Set _APP_URL using the selected app_id
         self._APP_URL = f"/apps/{app_id}/server-code"
+        self._registeredDevices: T.Optional[list[OmronDevice]] = None
 
         # Wrap transport with LogTransport for debug logging with credential redaction
         self._client = httpx.Client(
@@ -566,24 +570,41 @@ class OmronConnect1(OmronConnect):
                 name=f"{device['deviceModel']}:{device['userNumberInDevice']}",
                 macaddr=serial_to_mac(device["deviceSerialID"]),
                 user=int(device["userNumberInDevice"]),
+                real_serial=device["deviceSerialID"],
             )
             result.append(ocDev)
 
         return result
 
+    def _resolve_device(self, device: OmronDevice) -> OmronDevice:
+        """Find the server side device (real serial and model) matching a configured device by MAC and user."""
+
+        if self._registeredDevices is None:
+            self._registeredDevices = self.get_registered_devices(days=None) or []
+
+        for d in self._registeredDevices:
+            if d.macaddr.lower() == device.macaddr.lower() and d.user == device.user:
+                return d
+
+        L.debug(f"Device {device.name} not found in registered devices, using configured values")
+        return device
+
     # utc timestamps
     def get_measurements(
         self, device: OmronDevice, searchDateFrom: int = 0, searchDateTo: int = 0
     ) -> T.List[MeasurementTypes]:
+        regDevice = device if device.real_serial else self._resolve_device(device)
+        serial = regDevice.serial
         data = {
             "containCorrectedDataFlag": 1,
             "containAllDataTypeFlag": 1,
             "deviceCategory": device.category,
-            "deviceSerialID": device.serial,
+            # required, otherwise deviceModelList is always null
+            "deviceModel": regDevice.name.rsplit(":", 1)[0],
+            "deviceSerialID": serial,
             "userNumberInDevice": int(device.user),
             "searchDateFrom": searchDateFrom if searchDateFrom >= 0 else 0,
             "searchDateTo": int(U.utcnow().timestamp() * 1000) if searchDateTo <= 0 else searchDateTo,
-            # "deviceModel": "OGSC", "HBF-xxx", ...
         }
 
         r = self._client.post(
@@ -608,7 +629,7 @@ class OmronConnect1(OmronConnect):
 
         if _debugSaveResponse:
             assert device.category is not None, "Device category must be set for get_measurements"
-            fname = f".debug/{data['searchDateTo']}_{device.category.name}_{device.serial}_{device.user}.json"
+            fname = f".debug/{data['searchDateTo']}_{device.category.name}_{serial}_{device.user}.json"
             U.json_save(fname, returnedValue)
 
         measurements: T.List[MeasurementTypes] = []
@@ -618,12 +639,12 @@ class OmronConnect1(OmronConnect):
             return measurements
 
         for devModel in deviceModelList:
-            measurements.extend(self._process_device_model(devModel, device, devCat))
+            measurements.extend(self._process_device_model(devModel, device, serial, devCat))
 
         return measurements
 
     def _process_device_model(
-        self, devModel: T.Dict[str, T.Any], device: OmronDevice, devCat: DeviceCategory
+        self, devModel: T.Dict[str, T.Any], device: OmronDevice, serial: str, devCat: DeviceCategory
     ) -> T.List[MeasurementTypes]:
         measurements: T.List[MeasurementTypes] = []
         deviceModel = devModel["deviceModel"]
@@ -633,7 +654,7 @@ class OmronConnect1(OmronConnect):
             user = dev["userNumberInDevice"]
             L.debug(f" - deviceModel: {deviceModel} category: {devCat.name} serial: {deviceSerialID} user: {user}")
 
-            if deviceSerialID != device.serial:
+            if deviceSerialID != serial:
                 continue
 
             if device.category == DeviceCategory.BPM:
@@ -692,31 +713,18 @@ class OmronConnect1(OmronConnect):
             weight = convert_data_util(weight_entry.value, weight_entry.scale)
             weightUnit = weight_entry.subtype
             weight = convert_weight_to_kg(weight, weightUnit)
-            bodyFatPercentage = convert_data_util(
-                bodyIndexList[ValueType.BODY_FAT_PER_FIGURE].value,
-                bodyIndexList[ValueType.BODY_FAT_PER_FIGURE].scale,
-            )
-            skeletalMusclePercentage = convert_data_util(
-                bodyIndexList[ValueType.RATE_SKELETAL_MUSCLE_FIGURE].value,
-                bodyIndexList[ValueType.RATE_SKELETAL_MUSCLE_FIGURE].scale,
-            )
-            basal_met = convert_data_util(
-                bodyIndexList[ValueType.BASAL_METABOLISM_FIGURE].value,
-                bodyIndexList[ValueType.BASAL_METABOLISM_FIGURE].scale,
-            )
-            metabolic_age = convert_data_util(
-                bodyIndexList[ValueType.BIOLOGICAL_AGE_FIGURE].value,
-                bodyIndexList[ValueType.BIOLOGICAL_AGE_FIGURE].scale,
-                int,
-            )
-            visceral_fat_rating = convert_data_util(
-                bodyIndexList[ValueType.VISCERAL_FAT_FIGURE].value,
-                bodyIndexList[ValueType.VISCERAL_FAT_FIGURE].scale,
-            )
-            bmi = convert_data_util(
-                bodyIndexList[ValueType.BMI_FIGURE].value,
-                bodyIndexList[ValueType.BMI_FIGURE].scale,
-            )
+
+            def opt_value(valueType: ValueType, _type: type[float] | type[int] = float) -> T.Any:
+                # weight-only scales (e.g. HN-300T2) report no body composition values
+                item = bodyIndexList.get(valueType)
+                return convert_data_util(item.value, item.scale, _type) if item else _type(Decimal(-1))
+
+            bodyFatPercentage = opt_value(ValueType.BODY_FAT_PER_FIGURE)
+            skeletalMusclePercentage = opt_value(ValueType.RATE_SKELETAL_MUSCLE_FIGURE)
+            basal_met = opt_value(ValueType.BASAL_METABOLISM_FIGURE)
+            metabolic_age = opt_value(ValueType.BIOLOGICAL_AGE_FIGURE, int)
+            visceral_fat_rating = opt_value(ValueType.VISCERAL_FAT_FIGURE)
+            bmi = opt_value(ValueType.BMI_FIGURE)
             timeZone = pytz.timezone(m["timeZone"])
 
             wm = WeightMeasurement(
@@ -732,6 +740,142 @@ class OmronConnect1(OmronConnect):
             )
             measurements.append(wm)
 
+        return measurements
+
+
+class OmronConnect1BPManager(OmronConnect1):
+    """API v1 client for regions where blood pressure readings live in "BP Manager".
+
+    The OMRON connect app (e.g. SG region: AU, NZ, TH, ...) still uses Kii for device config, but BP readings
+    are stored in a separate service authenticated via AWS Cognito. Kii `measureData` returns no BP data there.
+    See https://github.com/bugficks/omramin/issues/13
+
+    Tokens of both services are stored as a single JSON string: {"kii": "...", "cognito": "..."}.
+    """
+
+    _VITAL_CATEGORY_BP = "0"
+
+    def __init__(self, server: str, country: str, bpManager: T.Dict[str, str]):
+        super().__init__(server, country)
+        self._bpmUrl = bpManager["url"]
+        self._cognitoUrl = f"https://cognito-idp.{bpManager['cognitoRegion']}.amazonaws.com/"
+        self._cognitoClientId = bpManager["cognitoClientId"]
+        self._bpmClient = httpx.Client(transport=HttpxLogTransport(httpx.HTTPTransport()))
+        self._bpmHeaders: T.Dict[str, str] = {}
+
+    def _cognito_auth(self, authFlow: str, authParameters: T.Dict[str, str]) -> T.Dict[str, T.Any]:
+        r = self._bpmClient.post(
+            self._cognitoUrl,
+            json={"AuthFlow": authFlow, "ClientId": self._cognitoClientId, "AuthParameters": authParameters},
+            headers={
+                "Content-Type": "application/x-amz-json-1.1",
+                "X-Amz-Target": "AWSCognitoIdentityProviderService.InitiateAuth",
+            },
+        )
+        r.raise_for_status()
+        result = r.json().get("AuthenticationResult")
+        if not result:
+            # e.g. a challenge (NEW_PASSWORD_REQUIRED, MFA, ...) which is not supported
+            raise ValueError(f"Cognito {authFlow} did not return tokens: {r.json().get('ChallengeName')}")
+
+        self._bpmHeaders["authorization"] = f"Bearer {result['AccessToken']}"
+        return result
+
+    def login(self, email: str, password: str, country: str = "") -> T.Optional[str]:
+        kiiToken = super().login(email, password, country)
+        if not kiiToken:
+            return None
+
+        result = self._cognito_auth("USER_PASSWORD_AUTH", {"USERNAME": email, "PASSWORD": password})
+        return json.dumps({"kii": kiiToken, "cognito": result["RefreshToken"]})
+
+    def refresh_oauth2(self, refresh_token: str, **kwargs: T.Any) -> T.Optional[str]:
+        try:
+            tokens = json.loads(refresh_token)
+            kiiToken, cognitoToken = tokens["kii"], tokens["cognito"]
+
+        except (json.JSONDecodeError, TypeError, KeyError) as exc:
+            # token stored by an older version (Kii only); forces re-login
+            raise ValueError("Stored token has no BP Manager token, login required") from exc
+
+        kiiToken = super().refresh_oauth2(kiiToken, **kwargs)
+        if not kiiToken:
+            return None
+
+        result = self._cognito_auth("REFRESH_TOKEN_AUTH", {"REFRESH_TOKEN": cognitoToken})
+        # Cognito only returns a new refresh token if rotation is enabled
+        return json.dumps({"kii": kiiToken, "cognito": result.get("RefreshToken", cognitoToken)})
+
+    def get_measurements(
+        self, device: OmronDevice, searchDateFrom: int = 0, searchDateTo: int = 0
+    ) -> T.List[MeasurementTypes]:
+        if device.category != DeviceCategory.BPM:
+            return super().get_measurements(device, searchDateFrom, searchDateTo)
+
+        searchDateFrom = max(searchDateFrom, 0)
+        if searchDateTo <= 0:
+            searchDateTo = int(U.utcnow().timestamp() * 1000)
+
+        # API expects local date/time; widen by a day to be timezone agnostic, exact filtering below.
+        fmt = "%Y%m%d%H%M"
+        dtFrom = datetime.datetime.fromtimestamp(searchDateFrom / 1000) - datetime.timedelta(days=1)
+        dtTo = datetime.datetime.fromtimestamp(searchDateTo / 1000) + datetime.timedelta(days=1)
+        data = {
+            "start_date_time": max(dtFrom, datetime.datetime(2000, 1, 1)).strftime(fmt),
+            "end_date_time": dtTo.strftime(fmt),
+            "traceId": "omramin",
+            "screenName": "fetch",
+            "vital_category": self._VITAL_CATEGORY_BP,
+        }
+        r = self._bpmClient.post(f"{self._bpmUrl}/api/get_vital_data", json=data, headers=self._bpmHeaders)
+        r.raise_for_status()
+        resp = r.json()
+        L.debug(resp)
+
+        if not resp.get("success"):
+            L.error(f"get_measurements() -> {r}: '{r.text}'")
+            return []
+
+        if _debugSaveResponse:
+            U.json_save(f".debug/{searchDateTo}_bpm_bpmanager.json", resp)
+
+        # vitals carry no serial/user, only model. Filter by model if device name is based on one.
+        model = device.name.split(":")[0]
+        filterModel = omron_model_to_device_category(model) is not None
+
+        measurements: T.List[MeasurementTypes] = []
+        for v in resp.get("vitals") or []:
+            if filterModel and v.get("deviceModel") and v["deviceModel"] != model:
+                L.debug(f"skipping model: {v['deviceModel']} != {model}")
+                continue
+
+            dtLocal = datetime.datetime.fromisoformat(v["measure_date"])
+            try:
+                timeZone: datetime.tzinfo = pytz.timezone(v["timeZone"])
+                dtLocal = dtLocal.astimezone(timeZone) if dtLocal.tzinfo else timeZone.localize(dtLocal)  # type: ignore
+
+            except (KeyError, pytz.UnknownTimeZoneError):
+                dtLocal = dtLocal.astimezone()
+                timeZone = dtLocal.tzinfo  # type: ignore
+
+            measurementDate = int(dtLocal.timestamp() * 1000)
+            if not searchDateFrom <= measurementDate <= searchDateTo:
+                continue
+
+            measurements.append(
+                BPMeasurement(
+                    systolic=v["systolic"],
+                    diastolic=v["diastolic"],
+                    pulse=v["pulse"],
+                    measurementDate=measurementDate,
+                    timeZone=timeZone,
+                    irregularHB=int(v.get("strange_pulse", 0)) != 0,
+                    movementDetect=int(v.get("is_motion", 0)) != 0,
+                    cuffWrapDetect=int(v.get("tight_fit", 1)) != 0,
+                )
+            )
+
+        measurements.sort(key=lambda m: m.measurementDate)
         return measurements
 
 
@@ -982,6 +1126,10 @@ class OmronConnect2(OmronConnect):
 
 def get_omron_connect(server: str, country: str) -> OmronConnect:
     if re.search(r"data-([a-z]{2})\.omronconnect\.com", server):
+        bpManager = get_bpmanager_config_for_server(server)
+        if bpManager:
+            return OmronConnect1BPManager(server, country, bpManager)
+
         return OmronConnect1(server, country)
 
     return OmronConnect2(server, country)
